@@ -1,0 +1,10 @@
+playwright
+groq
+faster-whisper
+av<19
+sounddevice
+soundfile
+fastapi
+uvicorn
+python-multipart
+langgraph

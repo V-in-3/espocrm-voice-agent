@@ -6,6 +6,7 @@
 <style>
   body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }
   button { font-size: 1em; padding: 0.6em 1.2em; margin: 0.3em 0; cursor: pointer; }
+  #examplePrompt { white-space: pre-line; }
   #log { white-space: pre-wrap; font-family: monospace; background: #f4f4f4; padding: 1em; margin-top: 1em; min-height: 2em; }
   #correction { display: none; margin-top: 1em; padding: 1em; background: #fff3cd; border: 1px solid #e0c060; }
   #result { margin-top: 1em; font-weight: bold; }
@@ -15,6 +16,7 @@
 <body>
 <h1>EspoCRM Voice Agent</h1>
 <p id="examplePrompt">Click Start, then say what contact to create.</p>
+<p>First name, last name and email are required. Phone and address are optional.</p>
 <button id="startBtn">Start talking</button>
 
 <script>
@@ -23,8 +25,11 @@
   const first = FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)];
   const last = LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)];
   document.getElementById("examplePrompt").textContent =
-    `Click Start, then say what contact to create (e.g. "Create a contact for ${first} ${last}, ` +
-    `email ${first.toLowerCase()} dot ${last.toLowerCase()} at example dot com").`;
+    `Click Start, then say what contact to create. For example:\n` +
+    `Create a contact:\nFirst name: ${first}\nLast name: ${last}\n` +
+    `Email: ${first.toLowerCase()} dot ${last.toLowerCase()} at example dot com\n` +
+    `Phone: plus one, six one seven, five five five, zero one four two\n` +
+    `City: Boston\nCountry: United States`;
 </script>
 
 <div id="log"></div>
@@ -32,6 +37,7 @@
 <div id="correction">
   <p id="correctionPrompt">About to save - say a correction, or confirm to continue.</p>
   <button id="correctBtn">Reply by voice</button>
+  <button id="confirmBtn" style="display:none;">Confirm and save</button>
   <div style="margin-top:0.6em;">
     <input id="textReply" type="text" placeholder="...or type the answer instead" style="width:60%;">
     <button id="textReplyBtn">Submit text</button>
@@ -120,7 +126,9 @@ async function upload(url, blob) {
   const form = new FormData();
   if (blob) form.append("audio", blob, "audio.webm");
   const resp = await fetch(url, { method: "POST", body: form });
-  return resp.json();
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+  return data;
 }
 
 
@@ -136,11 +144,16 @@ async function onStartClick() {
   startBtn.onclick = onStartClick; // recordPushToTalk took over onclick for the stop action
 
   startBtn.textContent = "Processing...";
-  const data = await upload("/api/session", blob);
-  startBtn.textContent = "Start talking";
-  sessionId = data.session_id;
-  pollingStopped = false;
-  schedulePoll();
+  try {
+    const data = await upload("/api/session", blob);
+    sessionId = data.session_id;
+    pollingStopped = false;
+    schedulePoll();
+  } catch (error) {
+    document.getElementById("log").textContent += `Could not start: ${error.message}\n`;
+  } finally {
+    startBtn.textContent = "Start talking";
+  }
 }
 
 document.getElementById("startBtn").onclick = onStartClick;
@@ -161,8 +174,13 @@ async function onCorrectClick() {
   correctBtn.onclick = onCorrectClick; // restore, same reason as onStartClick
 
   correctBtn.textContent = "Processing...";
-  await upload(`/api/session/${sessionId}/correction`, blob);
-  correctBtn.textContent = "Reply by voice";
+  try {
+    await upload(`/api/session/${sessionId}/correction`, blob);
+  } catch (error) {
+    document.getElementById("log").textContent += `Could not send reply: ${error.message}\n`;
+  } finally {
+    correctBtn.textContent = "Reply by voice";
+  }
 }
 
 document.getElementById("correctBtn").onclick = onCorrectClick;
@@ -175,7 +193,30 @@ document.getElementById("textReplyBtn").onclick = async () => {
   input.value = "";
   const form = new FormData();
   form.append("text", text);
-  await fetch(`/api/session/${sessionId}/correction`, { method: "POST", body: form });
+  try {
+    const response = await fetch(`/api/session/${sessionId}/correction`, { method: "POST", body: form });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  } catch (error) {
+    document.getElementById("log").textContent += `Could not send reply: ${error.message}\n`;
+  }
+};
+
+document.getElementById("confirmBtn").onclick = async () => {
+  const button = document.getElementById("confirmBtn");
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/session/${sessionId}/confirm`, { method: "POST" });
+    if (!response.ok) {
+      const data = await response.json();
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    document.getElementById("correction").style.display = "none";
+  } catch (error) {
+    document.getElementById("log").textContent += `Could not confirm: ${error.message}\n`;
+  } finally {
+    button.disabled = false;
+  }
 };
 
 async function poll() {
@@ -188,9 +229,11 @@ async function poll() {
     await speakText(line);
     seenLogLines++;
   }
-  if (data.status === "awaiting_correction") {
+  if (data.status === "awaiting_correction" || data.status === "awaiting_confirmation") {
     const lastLine = data.log.length ? data.log[data.log.length - 1] : "";
     document.getElementById("correctionPrompt").textContent = lastLine;
+    document.getElementById("confirmBtn").style.display =
+      data.status === "awaiting_confirmation" ? "inline-block" : "none";
     document.getElementById("correction").style.display = "block";
   }
   if (data.status === "done" || data.status === "error") {

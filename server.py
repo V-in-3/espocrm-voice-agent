@@ -1,5 +1,6 @@
 import os
 import queue
+import re
 import tempfile
 import threading
 import uuid
@@ -19,7 +20,7 @@ app = FastAPI()
 
 @dataclass
 class SessionState:
-    status: str = "running"  # running | awaiting_correction | done | error
+    status: str = "running"  # running | awaiting_correction | awaiting_confirmation | done | error
     log: list = field(default_factory=list)
     correction_queue: "queue.Queue" = field(default_factory=queue.Queue)
     result: Optional[dict] = None
@@ -34,38 +35,26 @@ def make_web_narrate(session: SessionState):
             session.log.append(f"Setting {args['field']} to {args['value']}")
         elif tool_name == "save":
             session.log.append("Saving the contact now")
+        elif tool_name == "link_account":
+            session.log.append(f"Linked account {args['name']}")
+        elif tool_name == "clear_account":
+            session.log.append("Removed the linked account")
 
     return narrate
 
 
-# There are endless ways to say "go ahead" (yes / continue / everything is good /
-# please save it / yes, yes) but a real correction almost always names a field or
-# uses a handful of signal words - so default to "this is a confirmation" and only
-# treat it as a correction when one of those signals is actually present. That is
-# the safer direction to be wrong in: a stray "correction" with no real content
-# just makes the model ask which field to change, instead of looping on a pause
-# forever because "please just save it" wasn't in a fixed phrase list.
-_CORRECTION_SIGNALS = (
-    "change",
-    "actually",
-    "instead",
-    "should be",
-    "correct it",
-    "update",
-    "fix",
-    "wrong",
-    "first name",
-    "last name",
-    "email",
-    "correction",
+_CONFIRMATION = re.compile(
+    r"(?:yes(?:[\s,]+yes)*|confirm(?: to continue)?|confirmed|continue|go ahead|proceed|"
+    r"(?:please\s+)?save(?:\s+(?:it|(?:the\s+)?contact))?"
+    r"(?:\s*,\s*(?:please|that's all|that is all))?|"
+    r"(?:everything is|everything's|all is|all|looks|that is|that's|it is|it's) "
+    r"(?:good|correct|right|fine|okay|ok))",
+    re.IGNORECASE,
 )
 
 
 def _is_confirmation(text: str) -> bool:
-    lowered = text.strip().lower()
-    if not lowered:
-        return True
-    return not any(signal in lowered for signal in _CORRECTION_SIGNALS)
+    return bool(_CONFIRMATION.fullmatch(text.strip().rstrip(".! ")))
 
 
 def make_web_pre_save_hook(session: SessionState):
@@ -73,15 +62,14 @@ def make_web_pre_save_hook(session: SessionState):
         # Blocks this session's background thread, not the HTTP request thread -
         # the frontend keeps polling /api/session/{id} while this waits.
         session.log.append("About to save. Say a correction now, or confirm to continue.")
-        session.status = "awaiting_correction"
+        session.status = "awaiting_confirmation"
         correction = session.correction_queue.get()
+        while not correction:
+            session.log.append("I did not hear a reply. Please confirm or say a correction.")
+            session.status = "awaiting_confirmation"
+            correction = session.correction_queue.get()
         session.status = "running"
         if correction and _is_confirmation(correction):
-            # "Everything is correct" said by voice is not a correction to apply -
-            # without this, it gets fed back as a new user turn, the model tries to
-            # save again, and pre_save_hook pauses a second time for the exact same
-            # reason, forever, because the only non-voice way to say "go ahead" was
-            # the dedicated Confirm button.
             session.log.append(f"Heard confirmation (not a correction): {correction!r}")
             return None
         if correction:
@@ -138,7 +126,7 @@ def run_session(session_id: str, audio_path: str) -> None:
             # Same discipline as the CLI stages: verify by reopening the record,
             # never take the model's own claim of success at face value.
             checks = crm.verify_saved_contact(
-                state["record_id"], filled["firstName"], filled["lastName"], filled["email"]
+                state["record_id"], filled["firstName"], filled["lastName"], filled["email"], filled
             )
             ok = all(checks.values())
             session.log.append(state["final_message"] or "")
@@ -190,13 +178,16 @@ async def post_correction(
     session = SESSIONS.get(session_id)
     if session is None:
         return JSONResponse({"error": "unknown session"}, status_code=404)
+    if session.status not in ("awaiting_correction", "awaiting_confirmation"):
+        return JSONResponse({"error": "session is not awaiting a reply"}, status_code=409)
 
     correction_text = None
+    log_entry = None
     if text:
         # Typed fallback bypasses STT entirely - for when voice keeps mangling
         # something like an email address, after a couple of failed attempts.
         correction_text = text
-        session.log.append(f"Typed: {text!r}")
+        log_entry = f"Typed: {text!r}"
     elif audio is not None:
         with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
             tmp.write(await audio.read())
@@ -205,9 +196,27 @@ async def post_correction(
         os.remove(audio_path)
         if text:
             correction_text = text
-            session.log.append(f"Correction recognized: {text!r} (confidence={confidence:.2f})")
+            log_entry = f"Correction recognized: {text!r} (confidence={confidence:.2f})"
 
+    if session.status not in ("awaiting_correction", "awaiting_confirmation"):
+        return JSONResponse({"error": "session is not awaiting a reply"}, status_code=409)
+    if log_entry:
+        session.log.append(log_entry)
+    session.status = "running"
     session.correction_queue.put(correction_text)
+    return {"ok": True}
+
+
+@app.post("/api/session/{session_id}/confirm")
+async def confirm_save(session_id: str):
+    session = SESSIONS.get(session_id)
+    if session is None:
+        return JSONResponse({"error": "unknown session"}, status_code=404)
+    if session.status != "awaiting_confirmation":
+        return JSONResponse({"error": "session is not awaiting save confirmation"}, status_code=409)
+    session.status = "running"
+    session.log.append("Confirmed save using the button.")
+    session.correction_queue.put("yes")
     return {"ok": True}
 
 

@@ -52,7 +52,7 @@ def record_audio(seconds: float = 5.0, cue: bool = True) -> np.ndarray:
     return audio.flatten()
 
 
-def transcribe(audio: np.ndarray, model_size: str = "base") -> tuple:
+def transcribe(audio: str | np.ndarray, model_size: str = "base") -> tuple:
     """Returns (text, confidence). confidence is derived from Whisper's own
     avg_logprob per segment (exp(avg_logprob), roughly 0..1) - the same
     "adaptive routing by confidence" idea as gmdh-predictive-engine's scoring
@@ -73,8 +73,8 @@ def transcribe(audio: np.ndarray, model_size: str = "base") -> tuple:
     return text, confidence
 
 
-def listen(seconds: float = 5.0, model_size: str = "base") -> tuple:
-    return transcribe(record_audio(seconds), model_size)
+def listen(seconds: float = 5.0, model_size: str = "base", cue: bool = True) -> tuple:
+    return transcribe(record_audio(seconds, cue=cue), model_size)
 
 
 def speak(text: str) -> None:
