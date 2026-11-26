@@ -3,6 +3,11 @@
 Voice-driven agent that operates the EspoCRM public demo (`demo.us.espocrm.com`)
 through a browser. Each stage below is runnable on its own.
 
+## Technical notes
+
+[Open the technical notes PDF](./technical-notes.pdf) for the stack, agent flow,
+and how the agent reads and interacts with the CRM interface.
+
 ## Setup
 
 ```bash
