@@ -42,7 +42,7 @@ def main() -> int:
         filled = state["filled"]
         # Same discipline as stage 1: never trust the model's own claim of success,
         # reopen the record and read it back.
-        checks = crm.verify_saved_contact(state["record_id"], filled["firstName"], filled["lastName"], filled["email"])
+        checks = crm.verify_saved_contact(state["record_id"], filled["firstName"], filled["lastName"], filled["email"], filled)
         print("record id:", state["record_id"])
         print("checks:", checks)
         ok = all(checks.values())

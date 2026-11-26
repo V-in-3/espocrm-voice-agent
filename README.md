@@ -12,7 +12,7 @@ and how the agent reads and interacts with the CRM interface.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install playwright groq faster-whisper 'av<19' sounddevice soundfile fastapi uvicorn python-multipart
+.venv/bin/pip install -r requirements.txt
 .venv/bin/python -m playwright install chromium  # or rely on channel="chrome", see browser.py
 ```
 
@@ -21,13 +21,14 @@ Chromium download usually isn't needed at all.
 
 ## Files
 
-- `browser.py` — `CrmBrowser`: `login`, `read_screen`, `fill_field`, `read_form`,
-  `save`, `verify_saved_contact`.
-- `tools.py` — OpenAI-style tool schemas for `read_screen`, `fill_field`, `save`.
+- `browser.py` — Playwright CRM navigation, field entry, account selection,
+  saving and verification.
+- `tools.py` — tool schemas for reading, filling, linking an account and saving.
 - `llm_client.py` — `LLMClient` + `MockClient` / `GroqClient` / `OllamaClient`,
   each formats its own assistant-message history shape via `build_assistant_message`.
-- `agent.py` — `run_agent`: the shared tool-calling loop used by every stage above 1.
-  Takes optional hooks: `confirm_fn` (human review of a field before it's typed),
+- `agent.py` — `run_agent`: a LangGraph workflow for model calls, tools, form
+  validation, clarification, confirmation and saving. Takes optional hooks:
+  `confirm_fn` (human review of a field before it's typed),
   `narrate_fn` (speak each action as it happens), `pre_save_hook` (pause right
   before Save for a correction), `clarify_hook` (the model asks for missing info
   and the conversation continues instead of ending).
@@ -75,6 +76,41 @@ Whatever the model claims, the script independently reopens the saved record and
 reads it back before printing `RESULT: OK` - the model's own "done" message is
 never trusted on its own.
 
+The graph requires first name, last name and a valid-looking email before saving.
+It can also fill a phone number and the supplied address components, for example
+city `Boston` and country `United States`. An existing account can be linked by its
+full name; similar matches require user clarification, and duplicate exact names
+cannot be selected automatically. The user can explicitly skip the account.
+The agent does not create accounts. Filled optional fields
+and selected account names are included in the post-save UI verification.
+
+### Updating contact details and linking an account
+
+The agent creates a new contact; it does not edit an existing saved contact.
+Before saving, it can:
+
+- Fill or correct the first name, last name, email, phone, street, city,
+  state/region, postal code and country. First name, last name and an email
+  with a valid-looking format are required; the other fields are optional.
+- Ask for unclear or missing information. At the pre-save pause, use **Reply
+  by voice** or type a correction, for example: "Change the last name to
+  Wilson and the email to emily dot wilson at example dot com." The agent
+  applies the correction and asks again before saving.
+- Link the contact to an **existing** account, for example: "Link the contact
+  to the account Example Company." Provide its full name. If the search returns
+  several similar accounts, reply with only the exact account name. If it is
+  missing or multiple accounts share that exact name, provide another name or
+  say "skip account"; saving remains blocked until the choice is resolved.
+- Replace an already selected account with another existing account, or
+  explicitly ask to remove the account. Skipping an unresolved account also
+  removes any previously selected account. The agent links at most one account
+  and does not create or edit accounts.
+- Review the form and say "yes" or click **Confirm and save**. The browser
+  reads the form before saving, then reopens the saved record and checks its
+  visible text for the entered values and account name. Check the resulting
+  link yourself as well; speech recognition and text-based verification are
+  not guarantees that the intended information was captured.
+
 ## Stage 3: voice on the CLI
 
 ```bash
@@ -95,24 +131,30 @@ export GROQ_API_KEY=...
 
 Open `http://localhost:8000`. The page:
 
-- Generates a fresh example name/email pair on every load (English names - a
+- Generates a fresh example name/email pair on every load and includes an
+  optional phone number and Boston, United States address (English names - a
   Ukrainian surname like "Petrenko" is noticeably harder for the small Whisper
   model to transcribe correctly than "Smith" or "Baker").
 - Push-to-talk: click **Start talking** once to begin recording, click the same
   button again to stop - no fixed recording duration to guess.
 - Speaks each step out loud via the browser's own `speechSynthesis` as the agent
   works (`fill_field`, `save`), so you can follow along as it navigates the CRM.
-- Pauses right before Save ("About to save...") for a spoken correction. Plain
-  confirmations ("yes", "continue", "everything is good", "please save it") are
-  told apart from real corrections by looking for correction-signal words
-  (change / actually / wrong / first name / last name / email / ...); anything
-  without one of those is treated as "no correction, proceed" by default.
+- Pauses right before Save ("About to save...") for a spoken correction. Explicit
+  confirmations such as "yes", "continue", "confirm to continue", "everything is good", and
+  "please save it" proceed; other non-empty replies are treated as corrections.
+  An empty reply does not confirm saving; the user is prompted again. The
+  **Confirm and save** button is available during the pre-save pause.
 - If the model is missing required info, it asks out loud and the conversation
   continues (`clarify_hook`) instead of ending the whole request.
 - A text field is also available everywhere a voice reply is expected, as a
   fallback for when Whisper keeps mangling the same phrase.
 - On completion, links to the saved record and to the Contacts list, so the
   result can be checked on screen, not just taken on faith from the JSON.
+
+If saving cannot be confirmed, the error includes any available CRM response
+status and visible alert. The outcome may be unknown even after a timeout:
+check the CRM Contacts list before trying again to avoid creating a duplicate.
+The agent does not automatically retry the save.
 
 ### Known limitation: spoken emails
 
@@ -124,8 +166,8 @@ is no literal "at" left to turn into "@". Mitigations in place:
   when Whisper does report them as separate words.
 - The LLM itself is often able to parse alternate phrasings that avoid the word
   "at" altogether (e.g. "email is john dot smith domain is example dot com").
-- The pause-before-save and clarify-hook loops mean a bad transcription leads to
-  the agent asking again, not to a wrong value getting silently saved.
+- The pause-before-save and clarify-hook loops let the user review or correct
+  uncertain information, but cannot detect every transcription error.
 - A typed fallback is always available as a last resort.
 
 ## Docker (Ollama backend)

@@ -19,6 +19,10 @@ def narrate(tool_name: str, args: dict) -> None:
         speak(f"Setting {args['field']} to {args['value']}")
     elif tool_name == "save":
         speak("Saving the contact now")
+    elif tool_name == "link_account":
+        speak(f"Linked account {args['name']}")
+    elif tool_name == "clear_account":
+        speak("Removed the linked account")
 
 
 def make_pre_save_hook(seconds: float = 4.0):
@@ -119,7 +123,7 @@ def main() -> int:
         # Never trust the model's own claim of success: reopen the record and read
         # back what actually landed, same discipline as stages 1 and 2. The voice
         # confirmation only fires after this check passes, not before.
-        checks = crm.verify_saved_contact(state["record_id"], filled["firstName"], filled["lastName"], filled["email"])
+        checks = crm.verify_saved_contact(state["record_id"], filled["firstName"], filled["lastName"], filled["email"], filled)
         print("record id:", state["record_id"])
         print("checks:", checks)
         ok = all(checks.values())
