@@ -1,0 +1,13 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: espocrm-ollama
+    ports:
+      - "11435:11434"
+    volumes:
+      - espocrm-ollama-data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  espocrm-ollama-data:
+    external: true

@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EspoCRM Voice Agent</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }
+  button { font-size: 1em; padding: 0.6em 1.2em; margin: 0.3em 0; cursor: pointer; }
+  #log { white-space: pre-wrap; font-family: monospace; background: #f4f4f4; padding: 1em; margin-top: 1em; min-height: 2em; }
+  #correction { display: none; margin-top: 1em; padding: 1em; background: #fff3cd; border: 1px solid #e0c060; }
+  #result { margin-top: 1em; font-weight: bold; }
+  #result a { display: inline-block; margin-top: 0.5em; }
+</style>
+</head>
+<body>
+<h1>EspoCRM Voice Agent</h1>
+<p id="examplePrompt">Click Start, then say what contact to create.</p>
+<button id="startBtn">Start talking</button>
+
+<script>
+  const FIRST_NAMES = ["John", "Michael", "David", "James", "Robert", "William", "Emily", "Sarah", "Olivia", "Grace"];
+  const LAST_NAMES = ["Smith", "Johnson", "Brown", "Taylor", "Clark", "Walker", "Harris", "Lewis", "Young", "Baker"];
+  const first = FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)];
+  const last = LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)];
+  document.getElementById("examplePrompt").textContent =
+    `Click Start, then say what contact to create (e.g. "Create a contact for ${first} ${last}, ` +
+    `email ${first.toLowerCase()} dot ${last.toLowerCase()} at example dot com").`;
+</script>
+
+<div id="log"></div>
+
+<div id="correction">
+  <p id="correctionPrompt">About to save - say a correction, or confirm to continue.</p>
+  <button id="correctBtn">Reply by voice</button>
+  <div style="margin-top:0.6em;">
+    <input id="textReply" type="text" placeholder="...or type the answer instead" style="width:60%;">
+    <button id="textReplyBtn">Submit text</button>
+  </div>
+</div>
+
+<div id="result"></div>
+
+<script>
+let sessionId = null;
+let pollTimer = null;
+let seenLogLines = 0;
+
+function speakText(text) {
+  if (!text) return Promise.resolve();
+  return new Promise((resolve) => {
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.onend = resolve;
+    utter.onerror = resolve;
+    window.speechSynthesis.speak(utter);
+  });
+}
+
+function waitForSpeechToFinish() {
+  return new Promise((resolve) => {
+    const check = () => {
+      if (!window.speechSynthesis.speaking) resolve();
+      else setTimeout(check, 100);
+    };
+    check();
+  });
+}
+
+function setStatus(el, text) {
+  el.textContent = text;
+}
+
+let preferredDeviceId = null;
+
+async function pickBuiltInMic() {
+  // Labels are only populated after a getUserMedia grant, so this only helps
+  // from the second recording onward - good enough to stop the device picker
+  // (incl. the iPhone Continuity mic) from resurfacing on every click.
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const builtIn = devices.find((d) => d.kind === "audioinput" && /macbook|built-in/i.test(d.label));
+    if (builtIn) preferredDeviceId = builtIn.deviceId;
+  } catch (e) {
+    /* enumeration not critical - fall back to default device */
+  }
+}
+
+// Push-to-talk: first click starts recording, second click (same button)
+// stops it - no more guessing a fixed number of seconds.
+async function recordPushToTalk(button, idleLabel) {
+  setStatus(button, "Requesting microphone access...");
+  const constraints = preferredDeviceId ? { audio: { deviceId: { exact: preferredDeviceId } } } : { audio: true };
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  await pickBuiltInMic();
+
+  // Let any speech already queued (e.g. the prompt that was just read out) fully
+  // finish before recording - the page's own voice through the speakers was
+  // getting picked up as if it were the user, since speak() does not wait.
+  setStatus(button, "Waiting for the agent to finish talking...");
+  await waitForSpeechToFinish();
+
+  const recorder = new MediaRecorder(stream);
+  const chunks = [];
+  recorder.ondataavailable = (e) => chunks.push(e.data);
+
+  const blob = await new Promise((resolve) => {
+    recorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      resolve(new Blob(chunks, { type: "audio/webm" }));
+    };
+    recorder.start();
+    button.textContent = "Recording... click again to stop";
+    button.onclick = () => recorder.stop();
+  });
+
+  button.textContent = idleLabel;
+  return blob;
+}
+
+async function upload(url, blob) {
+  const form = new FormData();
+  if (blob) form.append("audio", blob, "audio.webm");
+  const resp = await fetch(url, { method: "POST", body: form });
+  return resp.json();
+}
+
+
+
+async function onStartClick() {
+  document.getElementById("log").textContent = "";
+  document.getElementById("result").textContent = "";
+  document.getElementById("correction").style.display = "none";
+  seenLogLines = 0;
+
+  const startBtn = document.getElementById("startBtn");
+  const blob = await recordPushToTalk(startBtn, "Start talking");
+  startBtn.onclick = onStartClick; // recordPushToTalk took over onclick for the stop action
+
+  startBtn.textContent = "Processing...";
+  const data = await upload("/api/session", blob);
+  startBtn.textContent = "Start talking";
+  sessionId = data.session_id;
+  pollingStopped = false;
+  schedulePoll();
+}
+
+document.getElementById("startBtn").onclick = onStartClick;
+
+let pollingStopped = true;
+
+function schedulePoll() {
+  pollTimer = setTimeout(async () => {
+    await poll();
+    if (!pollingStopped) schedulePoll();
+  }, 1000);
+}
+
+async function onCorrectClick() {
+  document.getElementById("correction").style.display = "none";
+  const correctBtn = document.getElementById("correctBtn");
+  const blob = await recordPushToTalk(correctBtn, "Reply by voice");
+  correctBtn.onclick = onCorrectClick; // restore, same reason as onStartClick
+
+  correctBtn.textContent = "Processing...";
+  await upload(`/api/session/${sessionId}/correction`, blob);
+  correctBtn.textContent = "Reply by voice";
+}
+
+document.getElementById("correctBtn").onclick = onCorrectClick;
+
+document.getElementById("textReplyBtn").onclick = async () => {
+  const input = document.getElementById("textReply");
+  const text = input.value.trim();
+  if (!text) return;
+  document.getElementById("correction").style.display = "none";
+  input.value = "";
+  const form = new FormData();
+  form.append("text", text);
+  await fetch(`/api/session/${sessionId}/correction`, { method: "POST", body: form });
+};
+
+async function poll() {
+  const resp = await fetch(`/api/session/${sessionId}`);
+  const data = await resp.json();
+  const logDiv = document.getElementById("log");
+  while (seenLogLines < data.log.length) {
+    const line = data.log[seenLogLines];
+    logDiv.textContent += line + "\n";
+    await speakText(line);
+    seenLogLines++;
+  }
+  if (data.status === "awaiting_correction") {
+    const lastLine = data.log.length ? data.log[data.log.length - 1] : "";
+    document.getElementById("correctionPrompt").textContent = lastLine;
+    document.getElementById("correction").style.display = "block";
+  }
+  if (data.status === "done" || data.status === "error") {
+    pollingStopped = true;
+    clearTimeout(pollTimer);
+    const result = data.result || {};
+    let text = JSON.stringify(result, null, 2);
+    document.getElementById("result").textContent = text;
+    if (result.record_url) {
+      const link = document.createElement("a");
+      link.href = result.record_url;
+      link.target = "_blank";
+      link.textContent = "Open the saved record";
+      document.getElementById("result").appendChild(document.createElement("br"));
+      document.getElementById("result").appendChild(link);
+    }
+    if (result.contacts_list_url) {
+      const listLink = document.createElement("a");
+      listLink.href = result.contacts_list_url;
+      listLink.target = "_blank";
+      listLink.textContent = "Open the Contacts list (verify it's really there)";
+      document.getElementById("result").appendChild(document.createElement("br"));
+      document.getElementById("result").appendChild(listLink);
+    }
+  }
+}
+</script>
+</body>
+</html>
